@@ -880,6 +880,9 @@ class InsightsEngine:
         lines.append(f"**Tokens:** {o['total_tokens']:,} (in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})")
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{_format_duration(o['total_hours'] * 3600)} | **Avg session:** ~{_format_duration(o['avg_session_duration'])}")
+        # Cost estimate (may be $0.00 if pricing is unknown)
+        est_cost = o.get("estimated_cost", 0.0)
+        lines.append(f"**Est. cost:** ${est_cost:.2f}")
         lines.append("")
 
         # Models (top 5)
