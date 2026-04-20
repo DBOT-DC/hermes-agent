@@ -295,6 +295,42 @@ tools/orchestrator_tool.py  — orchestrate tool handler
 agent/bundled_modes/        — 10 shipped mode YAML definitions
 ```
 
+## System Prompt Builder (11-Section Modular Assembly)
+
+The port includes Roo Code's full modular system prompt architecture. The system
+prompt is assembled from 11 independent sections in canonical order:
+
+| # | Section | Function | Status |
+|---|---------|----------|--------|
+| 1 | Agent Identity | Role, name, personality | ✅ Existing (SOUL.md) |
+| 2 | Markdown Rules | Clickable file refs, formatting | ✅ `build_markdown_rules_section()` |
+| 3 | Tool Use Intro | Shared tool execution header | ✅ `build_tool_use_section()` |
+| 4 | Tool Guidelines | 3 numbered execution rules | ✅ `build_tool_use_guidelines_section()` |
+| 5 | Capabilities | CLI, file ops, search, MCP | ✅ `build_capabilities_section()` |
+| 6 | Available Modes | List all modes + whenToUse | ✅ `build_modes_section()` |
+| 7 | Mode Prompt | Role definition + 3-tier instructions | ✅ `build_mode_prompt()` |
+| 8 | Rules | File handling, git, path conventions | ✅ `build_rules_section()` |
+| 9 | System Info | OS, shell, home dir, workspace | ✅ `build_system_info_section()` |
+| 10 | Objective | Iterative task accomplishment | ✅ `build_objective_section()` |
+| 11 | Custom Instructions | Global → mode → project rules | ✅ `build_mode_prompt()` + `_load_project_instructions()` |
+
+### 3-Tier Instruction Hierarchy (Section 11)
+
+Instructions are layered from broadest to most specific:
+
+1. **Global rules** — `~/.hermes/instructions.md` (applies to all modes)
+2. **Mode rules** — `.hermes/modes/<mode>.yaml` `instructions:` field
+3. **Project rules** — `<workspace>/.hermes/instructions.md` (project-specific)
+
+Each tier can override or extend the previous one. The mode prompt includes the
+mode's role definition and any mode-specific skills.
+
+### Mode-Filtered Skills
+
+When a mode is active, the skills section is filtered to only show skills
+relevant to that mode's toolset. For example, `ask` mode won't show coding
+skills since it lacks write/terminal access.
+
 ## Testing
 
 ```bash
@@ -318,8 +354,9 @@ python -m pytest tests/agent/test_modes.py \
   tests/agent/test_hermesignore.py \
   tests/agent/test_project_config.py \
   tests/hermes_cli/test_mode_ui.py \
+  tests/agent/test_prompt_builder_sections.py \
   tests/test_roo_code_port.py \
   -v -o "addopts="
 ```
 
-299 tests, 0 failures.
+354 tests, 0 failures.

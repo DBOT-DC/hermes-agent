@@ -85,7 +85,7 @@ from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    build_nous_subscription_prompt, build_mode_prompt,
+    build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -98,7 +98,15 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import (
+    build_skills_system_prompt, build_context_files_prompt, build_environment_hints,
+    load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS,
+    DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE,
+    build_markdown_rules_section, build_tool_use_section, build_tool_use_guidelines_section,
+    build_capabilities_section, build_modes_section, build_system_info_section,
+    build_objective_section, build_rules_section, build_mode_filtered_skills_section,
+    build_mode_prompt,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -4131,15 +4139,51 @@ class AIAgent:
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-        # Mode-specific role guidance (code, architect, ask, debug, orchestrator)
-        # Use TERMINAL_CWD for project-level instruction discovery, consistent
-        # with how context files are resolved (avoids picking up install-dir files).
-        _mode_cwd = os.getenv("TERMINAL_CWD") or None
-        mode_prompt = build_mode_prompt(cwd=_mode_cwd)
+
+        # ── Roo Code modular prompt sections ──────────────────────────
+        # Sections 1-11 from Roo Code's system prompt builder, adapted for
+        # Hermes.  These are assembled in Roo Code's canonical order:
+        #   role → markdown → tool_use → tool_guidelines → capabilities →
+        #   modes → skills → rules → system_info → objective → custom_instructions
+        #
+        # Hermes already covers: role (identity above), custom_instructions
+        # (memory/context files below), and skills (below).  The remaining
+        # sections are injected here.
+
+        # Section 2: Markdown formatting rules
+        prompt_parts.append(build_markdown_rules_section())
+
+        # Section 3: Shared tool use intro
+        if self.valid_tool_names:
+            prompt_parts.append(build_tool_use_section())
+
+        # Section 4: Tool use guidelines (3 numbered guidelines)
+        if self.valid_tool_names:
+            prompt_parts.append(build_tool_use_guidelines_section())
+
+        # Section 5: Capabilities (CLI, file ops, search, etc.)
+        _context_cwd_for_caps = os.getenv("TERMINAL_CWD") or None
+        prompt_parts.append(build_capabilities_section(cwd=_context_cwd_for_caps))
+
+        # Section 6: Available modes (only when modes module is present)
+        modes_section = build_modes_section()
+        if modes_section:
+            prompt_parts.append(modes_section)
+
+        # Section 7: Mode-specific prompt (role definition + instructions)
+        mode_prompt = build_mode_prompt(cwd=_context_cwd_for_caps)
         if mode_prompt:
             prompt_parts.append(mode_prompt)
 
-        # so it can refer the user to them rather than reinventing answers.
+        # Section 8: Rules (file handling, path conventions, git rules)
+        prompt_parts.append(build_rules_section(cwd=_context_cwd_for_caps))
+
+        # Section 9: System information (OS, shell, home, workspace)
+        prompt_parts.append(build_system_info_section())
+
+        # Section 10: Objective (iterative task accomplishment)
+        prompt_parts.append(build_objective_section())
+
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
         # API-call time only so it stays out of the cached/stored system prompt.
@@ -4175,7 +4219,11 @@ class AIAgent:
                 )
                 if toolset
             }
-            skills_prompt = build_skills_system_prompt(
+            # Use mode-filtered skills when a mode is active, else full list
+            skills_prompt = build_mode_filtered_skills_section(
+                available_tools=self.valid_tool_names,
+                available_toolsets=avail_toolsets,
+            ) or build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
             )

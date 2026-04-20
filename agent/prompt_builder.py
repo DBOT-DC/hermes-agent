@@ -498,6 +498,257 @@ def build_environment_hints() -> str:
     return "\n\n".join(hints)
 
 
+# ============================================================================
+# Mode-specific prompt builder (Roo Code Section 11: custom instructions)
+# ============================================================================
+
+def build_mode_prompt(cwd: Optional[Path] = None) -> str:
+    """Return the mode-specific system prompt section.
+
+    When a mode is active, injects the mode's role definition and custom
+    instructions. When no mode is active (default), returns an empty string.
+
+    3-tier instruction hierarchy (each tier appends, doesn't replace):
+      1. Global config -- mode's role_definition + built-in guidance
+      2. Mode custom_instructions -- from the active mode definition
+      3. Project instructions -- from <cwd>/.hermes/instructions.md (appended last)
+
+    Args:
+        cwd: The working directory for the current task. When provided,
+             project-level instructions are loaded from <cwd>/.hermes/instructions.md
+             and appended with highest priority.
+    """
+    try:
+        from agent.modes import get_active_mode
+    except Exception:
+        return ""  # modes module unavailable
+
+    mode = get_active_mode()
+    if mode is None:
+        return ""
+
+    parts = [f"# Mode: {mode.name}\n"]
+    parts.append(mode.role_definition)
+
+    if mode.custom_instructions:
+        parts.append(mode.custom_instructions)
+
+    # Tier 3: Project-level instructions (highest priority, appended last)
+    if cwd is not None:
+        project_instructions = _load_project_instructions(cwd)
+        if project_instructions:
+            parts.append(project_instructions)
+
+    # If orchestrator (no direct tools), reinforce the delegation pattern
+    if mode.slug == "orchestrator":
+        parts.append(
+            "Reminder: you have NO direct tool access. "
+            "Use delegate_task to create specialist subagents for all work. "
+            "You coordinate and synthesise -- you do not execute directly."
+        )
+
+    return "\n\n".join(parts)
+
+
+def _load_project_instructions(cwd) -> str:
+    """Load project-level instructions from <cwd>/.hermes/instructions.md.
+
+    Returns an empty string if the file does not exist.
+    Content is scanned for prompt injection threats before loading.
+    Accepts str or Path for cwd.
+    """
+    cwd = Path(cwd) if cwd else None
+    if cwd is None:
+        return ""
+    instructions_file = cwd / ".hermes" / "instructions.md"
+    if not instructions_file.is_file():
+        return ""
+    try:
+        content = instructions_file.read_text(encoding="utf-8").strip()
+        if not content:
+            return ""
+        content = _scan_context_content(content, str(instructions_file))
+        result = f"## Project Instructions ({instructions_file})\n\n{content}"
+        return _truncate_content(result, ".hermes/instructions.md")
+    except Exception as e:
+        logger.debug("Could not read %s: %s", instructions_file, e)
+        return ""
+
+
+# ============================================================================
+# Roo Code-style modular prompt sections
+# ============================================================================
+
+def build_markdown_rules_section() -> str:
+    """Return MARKDOWN RULES section telling the model to reference files with clickable links."""
+    return (
+        "====\n\n"
+        "MARKDOWN RULES\n\n"
+        "When referencing files, use backtick-wrapped filenames: `filename.ext`. "
+        "When referencing specific lines, include line numbers: `filename.ext:42`. "
+        "Always use the relative path from the project root."
+    )
+
+
+def build_tool_use_section() -> str:
+    """Shared tool use intro section."""
+    return (
+        "====\n\n"
+        "TOOL USE\n\n"
+        "You have access to a set of tools. Use the provider-native tool-calling mechanism. "
+        "Do not include XML markup or examples of tool calls in your response."
+    )
+
+
+def build_tool_use_guidelines_section() -> str:
+    """3 numbered guidelines about assessing information needs, choosing tools, iterative use."""
+    return (
+        "====\n\n"
+        "TOOL USE GUIDELINES\n\n"
+        "1. Before using a tool, assess what information you already have and what additional "
+        "information you need.\n"
+        "2. Choose the most appropriate tool based on the type of action or information you need.\n"
+        "3. Use tools iteratively — refine your approach based on tool results across multiple "
+        "messages if needed. Each tool call should build on the results of previous calls."
+    )
+
+
+def build_capabilities_section(cwd: str = None) -> str:
+    """Return CAPABILITIES section describing available capabilities (CLI, file ops, search, etc.)."""
+    if cwd is None:
+        cwd = os.getcwd()
+    return (
+        "====\n\n"
+        "CAPABILITIES\n\n"
+        f"- You have access to CLI commands via the `terminal` tool — you can execute any shell command.\n"
+        "- You can list files and directories, read and write files, search file contents with regex.\n"
+        "- You can search the web, extract content from URLs, and browse websites.\n"
+        "- You can send messages to connected platforms (Telegram, Discord, etc.).\n"
+        "- You can delegate work to subagents via `delegate_task` for parallel execution.\n"
+        "- You can schedule recurring tasks via `cronjob`.\n"
+        "- You have persistent memory across sessions via the `memory` tool.\n"
+        "- You have access to a skills system — load specialized workflows with `skill_view`.\n"
+        f"- Current workspace directory: {cwd}\n"
+        "- Workspace file tree overview is available in environment_details when using terminal tools."
+    )
+
+
+def build_modes_section() -> str:
+    """Return MODES section listing all available modes with descriptions."""
+    try:
+        from agent.modes import list_modes
+        modes = list_modes()
+        if not modes:
+            return ""
+        mode_lines = []
+        for m in modes:
+            desc = m.role_definition.split(".")[0] if m.role_definition else m.slug
+            mode_lines.append(f' * "{m.name}" mode ({m.slug}) - {desc}')
+        return (
+            "====\n\n"
+            "MODES\n\n"
+            "These are the currently available modes:\n"
+            + "\n".join(mode_lines)
+        )
+    except Exception:
+        return ""
+
+
+def build_system_info_section() -> str:
+    """Return SYSTEM INFORMATION section with OS, shell, home dir, workspace dir."""
+    import platform
+    os_info = f"{platform.system()} {platform.release()}"
+    try:
+        shell = os.environ.get("SHELL", "/bin/sh")
+    except Exception:
+        shell = "/bin/sh"
+    try:
+        home = str(Path.home())
+    except Exception:
+        home = os.environ.get("HOME", "/unknown")
+    try:
+        cwd = os.getcwd()
+    except Exception:
+        cwd = "/unknown"
+    return (
+        "====\n\n"
+        "SYSTEM INFORMATION\n\n"
+        f"Operating System: {os_info}\n"
+        f"Default Shell: {shell}\n"
+        f"Home Directory: {home}\n"
+        f"Current Workspace Directory: {cwd}"
+    )
+
+
+def build_objective_section() -> str:
+    """Return OBJECTIVE section with iterative task accomplishment guidelines."""
+    return (
+        "====\n\n"
+        "OBJECTIVE\n\n"
+        "You are an AI assistant that accomplishes tasks iteratively using your available tools.\n"
+        "1. Analyze the user's request and identify all goals.\n"
+        "2. Prioritize goals and work through them sequentially using available tools.\n"
+        "3. If you need clarification, ask — but only when information is truly missing and cannot be inferred.\n"
+        "4. Continue working until all goals are met. Deliver results concisely.\n"
+        "5. Avoid unnecessary back-and-forth. Be thorough in a single pass when possible."
+    )
+
+
+def build_rules_section(cwd: str = None) -> str:
+    """Return RULES section with file handling rules, command chaining, path conventions."""
+    if cwd is None:
+        cwd = os.getcwd()
+    rules = [
+        "====\n\n"
+        "RULES\n\n",
+        "- All file paths should be relative to the current working directory unless absolute paths are required.\n"
+        "- Do not use `~` or `$HOME` in paths — resolve them to absolute paths.\n"
+        "- When editing files, always read the file first to understand its current content.\n"
+        "- When running terminal commands, prefer foreground execution for short commands and background execution for long-running processes.\n"
+        "- Do not restart development servers unless specifically asked — check if they are already running first.\n"
+        "- Use `trash` instead of `rm` when deleting files (recoverable > gone forever).\n"
+        "- When working with git, always check the current branch and status before making changes.\n"
+        "- Do not run destructive commands without asking first.\n"
+        f"- Working directory: {cwd}",
+    ]
+    return "".join(rules)
+
+
+def build_mode_filtered_skills_section(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+) -> str:
+    """Build a mode-filtered skills section for the system prompt.
+
+    Only includes skills relevant to the current mode. Falls back to
+    the full skills section when no mode is active.
+    """
+    try:
+        from agent.modes import get_active_mode
+        mode = get_active_mode()
+    except Exception:
+        mode = None
+
+    if mode is None:
+        # No mode active — return empty; full skills section handles it
+        return ""
+
+    # Get full skills prompt and add mode context
+    full_skills = build_skills_system_prompt(
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+    )
+    if not full_skills:
+        return ""
+
+    # Prepend mode filter note
+    return (
+        f"# Skills for {mode.name} mode\n"
+        "The following skills are available. Prioritize skills matching your current mode.\n\n"
+        + full_skills
+    )
+
+
 CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
