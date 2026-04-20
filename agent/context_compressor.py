@@ -58,6 +58,12 @@ _SUMMARY_TOKENS_CEILING = 12_000
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
+# Phase 5: Placeholder used when non-destructive truncation is applied
+_TRUNCATION_PLACEHOLDER = (
+    "[CONTEXT TRUNCATED — %d earlier turns were removed here to free context space. "
+    "A parent reference is preserved so the truncation can be traced back.]"
+)
+
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
@@ -263,6 +269,11 @@ class ContextCompressor(ContextEngine):
         api_key: str = "",
         provider: str = "",
         api_mode: str = "",
+        # Phase 5: Context management upgrade params
+        auto_condense_percent: float = None,
+        forced_reduction_percent: float = None,
+        max_window_retries: int = None,
+        token_buffer_percent: float = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         self.model = model
@@ -271,10 +282,28 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+
+        # threshold_tokens is used for the forced-reduction check (triggered on
+        # API context-overflow error), NOT for the auto-condense preflight.
+        # It is derived from threshold_percent (default 0.50), which is
+        # intentionally lower than auto_condense_percent (default 0.75)
+        # so the overflow handler fires at ~50% while preflight triggers at ~75%.
         self.threshold_tokens = max(
             int(context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
+
+        # Phase 5: Recalculate derived values when Phase 5 params are updated.
+        # Only update if explicitly provided (None means "don't change").
+        if auto_condense_percent is not None:
+            self.auto_condense_percent = auto_condense_percent
+        if forced_reduction_percent is not None:
+            self.forced_reduction_percent = forced_reduction_percent
+        if max_window_retries is not None:
+            self.max_window_retries = max_window_retries
+        if token_buffer_percent is not None:
+            self.token_buffer_percent = token_buffer_percent
+            self._token_buffer = int(context_length * token_buffer_percent)
 
     def __init__(
         self,
@@ -287,9 +316,14 @@ class ContextCompressor(ContextEngine):
         summary_model_override: str = None,
         base_url: str = "",
         api_key: str = "",
-        config_context_length: int | None = None,
+        config_context_length: "int | None" = None,
         provider: str = "",
         api_mode: str = "",
+        # Phase 5: Context management upgrades
+        auto_condense_percent: float = 0.75,
+        forced_reduction_percent: float = 0.75,
+        max_window_retries: int = 3,
+        token_buffer_percent: float = 0.10,
     ):
         self.model = model
         self.base_url = base_url
@@ -301,6 +335,12 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+
+        # Phase 5: Context management upgrade params
+        self.auto_condense_percent = auto_condense_percent
+        self.forced_reduction_percent = forced_reduction_percent
+        self.max_window_retries = max_window_retries
+        self.token_buffer_percent = token_buffer_percent
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -324,15 +364,23 @@ class ContextCompressor(ContextEngine):
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
+        # Phase 5: Token buffer — reserve headroom for response
+        self._token_buffer = int(self.context_length * token_buffer_percent)
+
         if not quiet_mode:
             logger.info(
                 "Context compressor initialized: model=%s context_length=%d "
                 "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-                "provider=%s base_url=%s",
+                "provider=%s base_url=%s "
+                "auto_condense=%.0f%% forced_reduction=%.0f%% max_retries=%d token_buffer=%d",
                 model, self.context_length, self.threshold_tokens,
                 threshold_percent * 100, self.summary_target_ratio * 100,
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
+                auto_condense_percent * 100,
+                forced_reduction_percent * 100,
+                max_window_retries,
+                self._token_buffer,
             )
         self._context_probed = False  # True after a step-down from context error
 
@@ -356,12 +404,24 @@ class ContextCompressor(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
+        Uses auto_condense_percent to trigger compression earlier than the
+        hard token threshold, giving the compressor headroom to act before
+        an API context-overflow error fires.
+
+        The effective threshold subtracts _token_buffer from context_length
+        to reserve headroom for the model's response (Phase 5).
+
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        if tokens < self.threshold_tokens:
+        if tokens <= 0:
+            return False
+        # Reserve token_buffer headroom for the model's response.
+        effective_context = self.context_length - self._token_buffer
+        auto_threshold = int(effective_context * self.auto_condense_percent)
+        if tokens < auto_threshold:
             return False
         # Anti-thrashing: back off if recent compressions were ineffective
         if self._ineffective_compression_count >= 2:
@@ -374,6 +434,159 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         return True
+    def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
+        """Quick rough check before the API call using estimated token count.
+
+        Uses estimate_messages_tokens_rough() to proactively trigger compression
+        before the actual API call, avoiding a context-overflow error on the
+        first request that exceeds the limit.
+        """
+        estimated_tokens = estimate_messages_tokens_rough(messages)
+        return self.should_compress(prompt_tokens=estimated_tokens)
+
+    # ------------------------------------------------------------------ #
+    # Phase 5: Sliding window truncation (non-destructive fallback)
+    # ------------------------------------------------------------------ #
+
+    def _sliding_window_truncate(
+        self,
+        messages: List[Dict[str, Any]],
+        target_tokens: "int | None" = None,
+    ) -> List[Dict[str, Any]]:
+        """Non-destructive truncation fallback when LLM summarization fails.
+
+        Protects head (system + first exchange) and tail (most recent by
+        token budget), replaces the middle with a truncation marker that
+        preserves the truncation_parent UUID so the gap is traceable.
+
+        Args:
+            messages: The full message list to truncate.
+            target_tokens: Target token count for the truncated output
+                (default: forced_reduction_percent of context_length).
+
+        Returns:
+            A new message list with middle turns replaced by the truncation marker.
+        """
+        import uuid as _uuid
+
+        if target_tokens is None:
+            target_tokens = int(self.context_length * self.forced_reduction_percent)
+
+        n = len(messages)
+        if n <= self.protect_first_n + 3:
+            # Too short to truncate meaningfully
+            return messages
+
+        truncation_id = str(_uuid.uuid4())
+        truncation_marker = {
+            "role": "system",
+            "content": _TRUNCATION_PLACEHOLDER % (n - self.protect_first_n - 3),
+            "_truncation_parent": truncation_id,
+            "_truncated_count": n - self.protect_first_n - 3,
+        }
+
+        # Find tail by token budget
+        tail_cut = self._find_tail_cut_by_tokens(
+            messages,
+            head_end=self.protect_first_n,
+            token_budget=target_tokens - 500,  # leave room for marker
+        )
+
+        # Build truncated list: head + marker + tail
+        result: List[Dict[str, Any]] = []
+        for i in range(self.protect_first_n):
+            result.append(messages[i].copy())
+
+        # Merge the marker into the last head message if it's a system message
+        marker_msg = truncation_marker.copy()
+        if result and result[-1].get("role") == "system":
+            existing = result[-1].get("content", "")
+            result[-1] = {
+                "role": "system",
+                "content": (
+                    existing.rstrip()
+                    + "\n\n"
+                    + marker_msg["content"]
+                ),
+                "_truncation_parent": truncation_id,
+                "_truncated_count": marker_msg["_truncated_count"],
+            }
+        else:
+            result.append(marker_msg)
+
+        for i in range(tail_cut, n):
+            result.append(messages[i].copy())
+
+        logger.info(
+            "Sliding window truncate: %d -> %d messages (target ~%d tokens), "
+            "truncation_id=%s",
+            n, len(result), target_tokens, truncation_id,
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Phase 5: Forced reduction (API context-overflow handler)
+    # ------------------------------------------------------------------ #
+
+    def handle_context_overflow(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: "int | None" = None,
+        focus_topic: str = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Handle a context-overflow API error with forced reduction.
+
+        Called when the API returns a context-length-exceeded error.
+        Strategy:
+          1. Try compress() first (LLM summarization).
+          2. If that fails or retries exhausted, fall back to
+             sliding_window_truncate() to 75% of context_length.
+          3. Retry up to max_window_retries times.
+
+        Args:
+            messages: The current message list.
+            current_tokens: Known token count (if available).
+            focus_topic: Optional focus topic for guided compression.
+
+        Returns:
+            (reduced_messages, retry_count) — retry_count is how many
+            reduction attempts were made.
+        """
+        import time as _time
+
+        MAX_RETRIES = self.max_window_retries
+        reduction_target = int(self.context_length * self.forced_reduction_percent)
+
+        for attempt in range(MAX_RETRIES):
+            # Step 1: Try LLM summarization first
+            compressed = self.compress(messages, current_tokens=current_tokens, focus_topic=focus_topic)
+            if compressed and len(compressed) < len(messages):
+                logger.info(
+                    "handle_context_overflow: LLM compression succeeded on attempt %d/%d",
+                    attempt + 1, MAX_RETRIES,
+                )
+                return compressed, attempt + 1
+
+            # Step 2: LLM compression failed or made no progress — use sliding window
+            logger.warning(
+                "handle_context_overflow: LLM compression failed on attempt %d/%d, "
+                "falling back to sliding window truncate",
+                attempt + 1, MAX_RETRIES,
+            )
+            messages = self._sliding_window_truncate(
+                messages,
+                target_tokens=reduction_target,
+            )
+            current_tokens = None  # reset after modification
+
+            if attempt < MAX_RETRIES - 1:
+                _time.sleep(0.5)  # Brief pause before retry
+
+        logger.error(
+            "handle_context_overflow: exhausted %d reduction attempts",
+            MAX_RETRIES,
+        )
+        return messages, MAX_RETRIES
 
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
@@ -381,7 +594,7 @@ class ContextCompressor(ContextEngine):
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
-        protect_tail_tokens: int | None = None,
+        protect_tail_tokens: "int | None" = None,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -752,7 +965,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
+            # Handle cases where content is None or not a string
+            # (GLM reasoning models may put everything in reasoning_content)
+            if content is None:
+                try:
+                    from agent.auxiliary_client import extract_content_or_reasoning
+                    content = extract_content_or_reasoning(response)
+                except Exception:
+                    content = ""
             if not isinstance(content, str):
                 content = str(content) if content else ""
             summary = content.strip()
@@ -986,7 +1206,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
-        token_budget: int | None = None,
+        token_budget: "int | None" = None,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.

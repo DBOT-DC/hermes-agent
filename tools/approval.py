@@ -682,7 +682,125 @@ def check_dangerous_command(command: str, env_type: str,
 
 
 # =========================================================================
-# Combined pre-exec guard (tirith + dangerous command detection)
+# Mode file constraint checking (Roo Code port)
+# =========================================================================
+
+def _extract_write_paths(command: str) -> list[str]:
+    """Extract file write destinations from a shell command.
+
+    Parses redirections (> / >>), tee targets, and copy/move/install
+    destinations so we can check them against the active mode's
+    file_regex constraint.
+    """
+    import re as _re
+
+    paths = []
+
+    # Strip ANSI escape sequences before parsing
+    from tools.ansi_strip import strip_ansi
+    cmd = strip_ansi(command)
+
+    # Redirections: > file  or  >> file
+    # Handles: echo hi > /tmp/out.txt
+    #          echo hi >> /var/log/app.log
+    #          cmd > "quoted path"  or  cmd > 'quoted path'
+    _REDIR_PAT = re.compile(r'''
+        >>?\s*
+        (?:
+            "([^"]*)"          |   # double-quoted: capture interior
+            '([^']*)'          |   # single-quoted: capture interior
+            (\S+)                  # unquoted: capture as-is
+        )
+    ''', re.VERBOSE)
+    for _m in _REDIR_PAT.finditer(cmd):
+        _raw = _m.group(1) or _m.group(2) or _m.group(3)
+        if _raw:
+            paths.append(_raw)
+
+    # tee targets: tee /tmp/listing.txt
+    # Matches: tee /tmp/listing.txt  (with optional -a flag)
+    _TEE_PAT = re.compile(r'''
+        \btee\s+
+        (?:-a\s+)*
+        (?:
+            "([^"]*)"          |
+            '([^']*)'          |
+            (\S+)
+        )
+    ''', re.VERBOSE)
+    for _m in _TEE_PAT.finditer(cmd):
+        _raw = _m.group(1) or _m.group(2) or _m.group(3)
+        if _raw:
+            paths.append(_raw)
+
+    # cp /src/file.py /dst/file.py  → destination is last argument
+    # mv /old/path.txt /new/path.txt
+    # install ... /usr/local/bin/app
+    if _re.search(r'\b(cp|mv|install)\b', cmd):
+        tokens = cmd.split()
+        if len(tokens) >= 3:
+            # Destination is the last token (after options)
+            last = tokens[-1]
+            # Skip flag arguments (-v, --verbose, etc.)
+            if not last.startswith('-') and not last.startswith('>'):
+                paths.append(last)
+
+    # sed -i 's/foo/bar/' /etc/config.conf  → file after -i
+    for _m in _re.finditer(r'sed\s+(?:-[^s\s]*\s*)*["\']?[^\s"\']+["\']?\s+["\']?([^\s"\']+)["\']?', cmd):
+        if _m.group(1) and not _m.group(1).startswith('s'):
+            paths.append(_m.group(1))
+
+    # Expand ~ in extracted paths
+    return [os.path.expanduser(p) for p in paths if p]
+
+
+def check_mode_file_constraint(command: str) -> list:
+    """Check whether a command's file targets are allowed by the active mode.
+
+    Returns a list of (blocked_path, error_message) tuples when the active
+    mode has a file_regex constraint that the command's write targets violate.
+    Returns an empty list when there is no active mode, no constraint, or
+    all targets are allowed.
+
+    Handles ImportError gracefully (returns [] when agent.modes is unavailable).
+    """
+    try:
+        import agent.modes as _modes
+        active_mode = _modes.get_active_mode()
+    except ImportError:
+        # agent.modes not available — allow without constraint
+        return []
+
+    if active_mode is None:
+        return []
+
+    constraints = getattr(active_mode, 'constraints', None)
+    if not constraints:
+        return []
+
+    file_regex = constraints.get('file_regex')
+    if not file_regex:
+        return []
+
+    write_targets = _extract_write_paths(command)
+    if not write_targets:
+        return []
+
+    import re as _re
+    violations = []
+    for target in write_targets:
+        if not _re.search(file_regex, target):
+            msg = (
+                f"'{target}' does not match '{file_regex}' for "
+                f"{getattr(active_mode, 'name', 'active')} mode."
+            )
+            violations.append((target, msg))
+
+    return violations
+
+
+# =========================================================================
+# Combined pre-exec guard (tirith + dangerous command detection + mode constraints)
 # =========================================================================
 
 def _format_tirith_description(tirith_result: dict) -> str:

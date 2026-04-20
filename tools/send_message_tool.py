@@ -723,6 +723,21 @@ def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
     return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
 
 
+async def _delete_telegram_message(token: str, chat_id, message_id) -> bool:
+    """Delete a Telegram message. Returns True on success, False on failure."""
+    try:
+        from telegram import Bot
+        bot = Bot(token=token)
+        await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+        return True
+    except Exception as e:
+        # Silently ignore: message >48h old, already deleted, no permissions, etc.
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug("Failed to delete Telegram message %s in %s: %s", message_id, chat_id, e)
+        return False
+
+
 async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
     """Send a single message via Discord REST API (no websocket client needed).
 

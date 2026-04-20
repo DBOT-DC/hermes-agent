@@ -50,6 +50,8 @@ _HERMES_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Mode switching, checkpoints, orchestration (agent-level tools)
+    "switch_mode", "checkpoint", "orchestrate",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -61,6 +63,55 @@ _HERMES_CORE_TOOLS = [
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
+
+
+# -----------------------------------------------------------------------
+# Tool Groups (used by the mode system for tool group gating)
+# -----------------------------------------------------------------------
+# Each group is a logical bucket of related tools.  MCP tools are resolved
+# dynamically at runtime from the MCP tool registry.
+
+TOOL_GROUPS = {
+    "read": [
+        "read_file", "search_files",
+        "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+        "browser_scroll", "browser_back", "browser_press", "browser_get_images",
+        "browser_vision", "browser_console",
+        "vision_analyze",
+        "web_search", "web_extract",
+        "session_search",
+        "skill_view", "skills_list",
+    ],
+    "edit": [
+        "write_file", "patch", "execute_code",
+    ],
+    "command": [
+        "terminal", "process",
+    ],
+    "mcp": [],  # dynamically resolved at runtime from MCP tool registrations
+}
+
+
+# Tools that are ALWAYS available regardless of mode.
+# These bypass mode-based tool group gating.
+ALWAYS_AVAILABLE_TOOLS = {
+    # Planning & memory
+    "todo", "memory", "clarify",
+    # Delegation
+    "delegate_task",
+    # Scheduling
+    "cronjob",
+    # Cross-platform messaging
+    "send_message",
+    # Home Assistant (gated by HASS_TOKEN via check_fn)
+    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Skills (always visible for discoverability)
+    "skills_list", "skill_view", "skill_manage",
+    # Session history (always useful for context)
+    "session_search",
+    # Mode switching
+    "switch_mode",
+}
 
 
 # Core toolset definitions
@@ -188,7 +239,7 @@ TOOLSETS = {
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
-        "tools": ["delegate_task"],
+        "tools": ["delegate_task", "orchestrate"],
         "includes": []
     },
 

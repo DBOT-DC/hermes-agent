@@ -351,6 +351,7 @@ DEFAULT_CONFIG = {
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,
+        "default_mode": "orchestrator",
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -439,8 +440,24 @@ DEFAULT_CONFIG = {
     # When enabled, the agent takes a snapshot of the working directory once per
     # conversation turn (on first write_file/patch call).  Use /rollback to restore.
     "checkpoints": {
-        "enabled": True,
-        "max_snapshots": 50,  # Max checkpoints to keep per directory
+        "enabled": False,
+        "max_snapshots": 50,
+        "auto_save": True,  # automatically checkpoint before write_file/patch
+    },
+
+    # Mode system — operational modes that gate tool access per Roo-Code pattern.
+    # Each mode defines which tool groups are available (read, edit, command, mcp).
+    "modes": {
+        "default": "code",
+        "auto_switch": False,  # if True, agent can auto-switch modes
+    },
+
+    # Context management — fine-grained control over compression and truncation.
+    "context": {
+        "auto_condense_percent": 0.75,       # compress when context usage exceeds this ratio
+        "forced_reduction_percent": 0.75,    # reduce to this % on overflow
+        "max_window_retries": 3,             # retry attempts on context overflow
+        "token_buffer_percent": 0.10,        # reserve this % for response headroom
     },
 
     # Maximum characters returned by a single read_file call.  Reads that
@@ -663,6 +680,28 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Phase 5 upgrades (used by the built-in compressor):
+        # Trigger auto-compression at this fraction of context_length (default 0.75).
+        # Fires before the hard token threshold for early headroom.
+        "auto_condense_percent": 0.75,
+        # Target token count when forced reduction is applied (default 0.75 = 75% of context).
+        # Used by handle_context_overflow() as the target after a context-overflow API error.
+        "forced_reduction_percent": 0.75,
+        # Maximum reduction attempts when context-overflow occurs (default 3).
+        "max_window_retries": 3,
+        # Fraction of context_length to reserve as token buffer for response headroom (default 0.10).
+        "token_buffer_percent": 0.10,
+    },
+
+    # Error recovery — controls retry behavior for API errors and rate limits.
+    # All values here are defaults; they can be overridden per-run via agent config.
+    "error_recovery": {
+        "max_retries": 5,          # maximum API retry attempts before falling back or giving up
+        "base_delay": 5.0,         # initial backoff delay in seconds (API errors)
+        "max_delay": 120.0,        # maximum backoff delay cap in seconds (API errors)
+        "rate_limit_base_delay": 2.0,   # initial backoff delay in seconds (rate limits)
+        "rate_limit_max_delay": 60.0,   # maximum backoff delay cap in seconds (rate limits)
+        "tool_retry_budget": 3,    # maximum retries per tool name per turn before skipping
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

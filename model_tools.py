@@ -129,7 +129,48 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+def _discover_tools():
+    """Import all tool modules to trigger their registry.register() calls.
+
+    Wrapped in a function so import errors in optional tools (e.g., fal_client
+    not installed) don't prevent the rest from loading.
+    """
+    _modules = [
+        "tools.web_tools",
+        "tools.terminal_tool",
+        "tools.file_tools",
+        "tools.vision_tools",
+        "tools.mixture_of_agents_tool",
+        "tools.image_generation_tool",
+        "tools.skills_tool",
+        "tools.skill_manager_tool",
+        "tools.browser_tool",
+        "tools.cronjob_tools",
+        "tools.rl_training_tool",
+        "tools.tts_tool",
+        "tools.todo_tool",
+        "tools.memory_tool",
+        "tools.session_search_tool",
+        "tools.clarify_tool",
+        "tools.code_execution_tool",
+        "tools.delegate_tool",
+        "tools.process_registry",
+        "tools.send_message_tool",
+        # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
+        "tools.homeassistant_tool",
+        "tools.mode_tool",
+        "tools.checkpoint_tool",
+        "tools.orchestrator_tool",
+    ]
+    import importlib
+    for mod_name in _modules:
+        try:
+            importlib.import_module(mod_name)
+        except Exception as e:
+            logger.warning("Could not import tool module %s: %s", mod_name, e)
+
+
+_discover_tools()
 
 # MCP tool discovery (external MCP servers from config)
 try:
@@ -197,6 +238,7 @@ def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    active_mode=None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -207,6 +249,9 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        active_mode: Optional Mode object. When provided, tool definitions are
+                     further filtered to only include tools allowed by the mode
+                     (always-available tools are always included).
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -262,6 +307,17 @@ def get_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    # Apply mode-based tool group gating when active_mode is set.
+    # Mode filtering happens after check_fn so that unavailable (gated) tools
+    # don't get shown even if their environment is configured.
+    if active_mode is not None:
+        from agent.modes import is_tool_allowed_by_mode, get_mcp_tool_names
+        mcp_tools = get_mcp_tool_names()
+        filtered_tools = [
+            td for td in filtered_tools
+            if is_tool_allowed_by_mode(td["function"]["name"], active_mode)
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -519,6 +575,68 @@ def handle_function_call(
                 notify_other_tool_call(task_id or "default")
             except Exception:
                 pass  # file_tools may not be loaded yet
+
+        # Mode-based file_regex constraint check for edit-group tools.
+        # Applied here so the error is returned as a tool result rather than
+        # silently ignored at the schema level.
+        #
+        # execute_code is gated at the schema level (is_tool_allowed_by_mode
+        # filters it out for modes without the 'edit' tool group), so it is
+        # included here for completeness but this block adds no additional
+        # restriction for execute_code beyond what the schema already enforces.
+        if function_name in ("write_file", "patch", "execute_code"):
+            try:
+                from agent.modes import get_active_mode, is_tool_allowed_by_mode
+                mode = get_active_mode()
+                if mode is not None:
+                    file_path = function_args.get("path") or function_args.get("file_path") or ""
+                    if not is_tool_allowed_by_mode(function_name, mode, file_path=file_path):
+                        return json.dumps({
+                            "error": (
+                                f"'{function_name}' is restricted in {mode.name} mode. "
+                                f"File path '{file_path}' does not match the allowed pattern."
+                            )
+                        }, ensure_ascii=False)
+            except Exception:
+                # modes module may not be available; skip constraint check.
+                # Graceful degradation ensures this never blocks tool execution.
+                pass  # noqa: B901
+
+        # .hermesignore check — applies to all file-path tools.
+        _HERMESIGNORE_TOOLS = (
+            "read_file", "write_file", "patch", "search_files",
+            "terminal", "execute_code",
+        )
+        if function_name in _HERMESIGNORE_TOOLS:
+            _file_path_arg: str = (
+                function_args.get("path")
+                or function_args.get("file_path")
+                or function_args.get("query")
+                or ""
+            )
+            if _file_path_arg:
+                try:
+                    from agent.hermesignore import load_hermesignore, is_path_ignored
+                    # Resolve working directory from session context.
+                    _cwd: Path = Path.cwd()
+                    try:
+                        from gateway.session_context import get_session_env
+                        _project_dir = get_session_env("HERMES_PROJECT_DIR")
+                        if _project_dir:
+                            _cwd = Path(_project_dir)
+                    except Exception:
+                        pass
+                    _patterns = load_hermesignore(_cwd)
+                    if _patterns and is_path_ignored(_file_path_arg, _patterns):
+                        return json.dumps({
+                            "error": (
+                                f"Path '{_file_path_arg}' is ignored by .hermesignore. "
+                                f"Edit .hermesignore to allow access."
+                            )
+                        }, ensure_ascii=False)
+                except Exception:
+                    # hermesignore module may not be available; skip silently.
+                    pass
 
         if function_name == "execute_code":
             # Prefer the caller-provided list so subagents can't overwrite

@@ -85,7 +85,7 @@ from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    build_nous_subscription_prompt,
+    build_nous_subscription_prompt, build_mode_prompt,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -110,6 +110,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.modes import get_active_mode
 from utils import atomic_json_write, env_var_enabled
 
 
@@ -1346,11 +1347,36 @@ class AIAgent:
                 print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
+        # Load config once — used for mode defaults, memory, compression, error recovery, etc.
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            self._config = _load_agent_config()
+        except Exception:
+            self._config = {}
+
+        # Apply default mode from config (before loading tools so mode gating applies)
+        if self._config and self._config.get("agent", {}).get("default_mode"):
+            try:
+                from agent.modes import set_active_mode, get_active_mode
+                if get_active_mode() is None:
+                    set_active_mode(self._config["agent"]["default_mode"])
+                    if not self.quiet_mode:
+                        print(f"🎯 Default mode: {self._config['agent']['default_mode']}")
+            except Exception:
+                pass  # Mode system not available, continue without mode
+
+        # Ensure get_active_mode is available for tool gating (even if no default mode set)
+        try:
+            from agent.modes import get_active_mode
+        except Exception:
+            get_active_mode = None
+
         # Get available tools with filtering
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
+            active_mode=get_active_mode() if get_active_mode else None,
         )
         
         # Show tool configuration and store valid tool names for validation
@@ -1418,13 +1444,31 @@ class AIAgent:
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
         
-        # Filesystem checkpoint manager (transparent — not a tool)
-        from tools.checkpoint_manager import CheckpointManager
-        self._checkpoint_mgr = CheckpointManager(
+        # Filesystem checkpoint service (transparent infrastructure + LLM-facing tool).
+        # CheckpointService wraps CheckpointManager with per-turn dedup and auto-save hooks.
+        # Also reads checkpoints.auto_save from config when available.
+        _cp_auto_save = True
+        try:
+            _cp_cfg = self._config.get("checkpoints", {})
+            if isinstance(_cp_cfg, dict):
+                _cp_auto_save = str(_cp_cfg.get("auto_save", "true")).lower() in ("true", "1", "yes")
+        except Exception:
+            pass
+        from agent.checkpoint_service import CheckpointService
+        self._checkpoint_service = CheckpointService(
             enabled=checkpoints_enabled,
             max_snapshots=checkpoint_max_snapshots,
+            auto_save=_cp_auto_save,
         )
-        
+        # Backward-compat alias so old code can use _checkpoint_mgr
+        self._checkpoint_mgr = self._checkpoint_service
+        # Inject checkpoint service into the stateless checkpoint tool
+        try:
+            from tools.checkpoint_tool import set_checkpoint_service
+            set_checkpoint_service(self._checkpoint_service)
+        except Exception:
+            pass  # checkpoint_tool may not be loaded yet
+
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
@@ -1457,7 +1501,6 @@ class AIAgent:
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
-        
         # Load config once for memory, skills, and compression sections
         try:
             from hermes_cli.config import load_config as _load_agent_config
@@ -1477,9 +1520,10 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        self._tool_retry_counts: dict = {}  # tracks per-tool retry counts per turn
         if not skip_memory:
             try:
-                mem_config = _agent_cfg.get("memory", {})
+                mem_config = self._config.get("memory", {})
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1575,14 +1619,14 @@ class AIAgent:
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
         try:
-            skills_config = _agent_cfg.get("skills", {})
+            skills_config = self._config.get("skills", {})
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
         except Exception:
             pass
 
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
-        _agent_section = _agent_cfg.get("agent", {})
+        _agent_section = self._config.get("agent", {})
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
@@ -1590,7 +1634,7 @@ class AIAgent:
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
-        _compression_cfg = _agent_cfg.get("compression", {})
+        _compression_cfg = self._config.get("compression", {})
         if not isinstance(_compression_cfg, dict):
             _compression_cfg = {}
         compression_threshold = float(_compression_cfg.get("threshold", 0.50))
@@ -1617,7 +1661,7 @@ class AIAgent:
         self._aux_compression_context_length_config = _aux_context_config
 
         # Read explicit context_length override from model config
-        _model_cfg = _agent_cfg.get("model", {})
+        _model_cfg = self._config.get("model", {})
         if isinstance(_model_cfg, dict):
             _config_context_length = _model_cfg.get("context_length")
         else:
@@ -1648,9 +1692,9 @@ class AIAgent:
         if _config_context_length is None:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
-                _custom_providers = get_compatible_custom_providers(_agent_cfg)
+                _custom_providers = get_compatible_custom_providers(self._config)
             except Exception:
-                _custom_providers = _agent_cfg.get("custom_providers")
+                _custom_providers = self._config.get("custom_providers")
                 if not isinstance(_custom_providers, list):
                     _custom_providers = []
             for _cp_entry in _custom_providers:
@@ -1691,7 +1735,7 @@ class AIAgent:
         _selected_engine = None
         _engine_name = "compressor"  # default
         try:
-            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+            _ctx_cfg = self._config.get("context", {}) if isinstance(self._config, dict) else {}
             _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
         except Exception:
             pass
@@ -1738,10 +1782,26 @@ class AIAgent:
                 base_url=self.base_url,
                 api_key=getattr(self, "api_key", ""),
                 provider=self.provider,
+                # Note: Phase 5 params (auto_condense_percent, forced_reduction_percent,
+                # max_window_retries, token_buffer_percent) are NOT propagated to plugin
+                # engines here. Plugin engines are custom/third-party and may not
+                # implement these parameters. They can be updated separately by the
+                # plugin if desired.
             )
             if not self.quiet_mode:
                 logger.info("Using context engine: %s", _selected_engine.name)
         else:
+            # Phase 5: Pull upgrade params from context section (gracefully default)
+            _ctx_engine_cfg = {}
+            try:
+                _ctx_engine_cfg = self._config.get("context", {}) if isinstance(self._config, dict) else {}
+            except Exception:
+                pass
+            _auto_condense = float(_ctx_engine_cfg.get("auto_condense_percent", 0.75))
+            _forced_reduction = float(_ctx_engine_cfg.get("forced_reduction_percent", 0.75))
+            _max_retries = int(_ctx_engine_cfg.get("max_window_retries", 3))
+            _token_buffer = float(_ctx_engine_cfg.get("token_buffer_percent", 0.10))
+
             self.context_compressor = ContextCompressor(
                 model=self.model,
                 threshold_percent=compression_threshold,
@@ -1755,6 +1815,11 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                # Phase 5: Context management upgrades
+                auto_condense_percent=_auto_condense,
+                forced_reduction_percent=_forced_reduction,
+                max_window_retries=_max_retries,
+                token_buffer_percent=_token_buffer,
             )
         self.compression_enabled = compression_enabled
 
@@ -4066,6 +4131,14 @@ class AIAgent:
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
+        # Mode-specific role guidance (code, architect, ask, debug, orchestrator)
+        # Use TERMINAL_CWD for project-level instruction discovery, consistent
+        # with how context files are resolved (avoids picking up install-dir files).
+        _mode_cwd = os.getenv("TERMINAL_CWD") or None
+        mode_prompt = build_mode_prompt(cwd=_mode_cwd)
+        if mode_prompt:
+            prompt_parts.append(mode_prompt)
+
         # so it can refer the user to them rather than reinventing answers.
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
@@ -5819,6 +5892,29 @@ class AIAgent:
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
+    # ── API request queue (cross-process rate-limit throttle) ──────────
+
+    def _acquire_api_queue_slot(self) -> float | None:
+        """Acquire a slot in the cross-process API request queue.
+
+        Returns the number of seconds to sleep before proceeding, or None
+        if queuing is disabled.  Uses the same file-based state as
+        auxiliary_client to coordinate across gateway workers.
+        """
+        from agent.auxiliary_client import _load_queue_config, _acquire_api_slot
+        cfg = _load_queue_config()
+        if not cfg.get("enabled", False):
+            return None
+        return _acquire_api_slot(f"agent-{id(self)}")
+
+    def _release_api_queue_slot(self) -> None:
+        """Release a slot in the cross-process API request queue."""
+        from agent.auxiliary_client import _load_queue_config, _release_api_slot
+        cfg = _load_queue_config()
+        if not cfg.get("enabled", False):
+            return
+        _release_api_slot()
+
     def _interruptible_api_call(self, api_kwargs: dict):
         """
         Run the API call in a background thread so the main conversation loop
@@ -6855,7 +6951,7 @@ class AIAgent:
             # SDK default.
             _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
-            if fb_api_mode == "anthropic_messages":
+            if fb_api_mode == "anthropic_messages" and fb_provider == "anthropic":
                 # Build native Anthropic client instead of using OpenAI client
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
                 effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
@@ -8082,6 +8178,29 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
+    def _sliding_window_fallback(self, messages, system_message):
+        """Last-ditch sliding window truncation when LLM compression is exhausted.
+
+        Returns (messages, active_system_prompt) if truncation succeeded,
+        or None if no compressor / no sliding window available.
+        """
+        if not self.context_compressor or not hasattr(self.context_compressor, '_sliding_window_truncate'):
+            return None
+        self._vprint(
+            f"{self.log_prefix}⚠️  LLM compression exhausted — trying sliding window truncation as fallback...",
+            force=True,
+        )
+        target = int(
+            self.context_compressor.context_length
+            * self.context_compressor.forced_reduction_percent
+        )
+        messages = self.context_compressor._sliding_window_truncate(
+            messages, target_tokens=target
+        )
+        self._invalidate_system_prompt()
+        new_system_prompt = self._build_system_prompt(system_message)
+        return messages, new_system_prompt
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -8206,6 +8325,28 @@ class AIAgent:
             )
         finally:
             self._executing_tools = False
+            # If any tool was switch_mode, refresh the tool list for the new mode
+            if any(tc.function.name == "switch_mode" for tc in tool_calls):
+                self._refresh_tools_for_mode()
+
+    def _refresh_tools_for_mode(self) -> None:
+        """Re-read the active mode and rebuild the tool list.
+
+        Called after switch_mode to ensure the next API call sends the
+        correct tool schemas for the new mode.
+        """
+        from agent.modes import get_active_mode
+        mode = get_active_mode()
+        self.tools = get_tool_definitions(
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=self.quiet_mode,
+            active_mode=mode,
+        )
+        self.valid_tool_names = {tool["function"]["name"] for tool in self.tools} if self.tools else set()
+        mode_slug = mode.slug if mode else "none"
+        if not self.quiet_mode:
+            print(f"🔄 Mode refresh ({mode_slug}): {len(self.tools)} tools")
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
@@ -8226,6 +8367,13 @@ class AIAgent:
             pass
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+
+        # Per-tool retry budget enforcement — skip if exceeded
+        _tool_budget = self._config.get('error_recovery', {}).get('tool_retry_budget', 3)
+        if self._tool_retry_counts.get(function_name, 0) >= _tool_budget:
+            return json.dumps({
+                "error": f"Tool '{function_name}' exceeded retry budget ({_tool_budget}) for this turn."
+            }, ensure_ascii=False)
 
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
@@ -8358,22 +8506,22 @@ class AIAgent:
                 function_args = {}
 
             # Checkpoint for file-mutating tools
-            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if function_name in ("write_file", "patch") and self._checkpoint_service.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
-                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+                        work_dir = self._checkpoint_service.get_working_dir_for_path(file_path)
+                        self._checkpoint_service.ensure_checkpoint(work_dir, f"before {function_name}")
                 except Exception:
                     pass
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
+            if function_name == "terminal" and self._checkpoint_service.enabled:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
                         cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        self._checkpoint_mgr.ensure_checkpoint(
+                        self._checkpoint_service.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
                 except Exception:
@@ -8457,6 +8605,8 @@ class AIAgent:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            # Track per-tool retry count for budget enforcement
+            self._tool_retry_counts[function_name] = self._tool_retry_counts.get(function_name, 0) + 1
             results[index] = (function_name, function_args, result, duration, is_error)
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -8712,24 +8862,24 @@ class AIAgent:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
             # Checkpoint: snapshot working dir before file-mutating tools
-            if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_service.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
-                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        self._checkpoint_mgr.ensure_checkpoint(
+                        work_dir = self._checkpoint_service.get_working_dir_for_path(file_path)
+                        self._checkpoint_service.ensure_checkpoint(
                             work_dir, f"before {function_name}"
                         )
                 except Exception:
                     pass  # never block tool execution
 
             # Checkpoint before destructive terminal commands
-            if _block_msg is None and function_name == "terminal" and self._checkpoint_mgr.enabled:
+            if _block_msg is None and function_name == "terminal" and self._checkpoint_service.enabled:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
                         cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        self._checkpoint_mgr.ensure_checkpoint(
+                        self._checkpoint_service.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
                 except Exception:
@@ -8737,7 +8887,14 @@ class AIAgent:
 
             tool_start_time = time.time()
 
-            if _block_msg is not None:
+            # Per-tool retry budget enforcement — skip if exceeded
+            _tool_budget = self._config.get('error_recovery', {}).get('tool_retry_budget', 3)
+            if self._tool_retry_counts.get(function_name, 0) >= _tool_budget:
+                function_result = json.dumps({
+                    "error": f"Tool '{function_name}' exceeded retry budget ({_tool_budget}) for this turn."
+                }, ensure_ascii=False)
+                tool_duration = 0.0
+            elif _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
@@ -8979,6 +9136,8 @@ class AIAgent:
             # injection lands as soon as a tool finishes — not after the
             # entire batch.  The model sees it on the next API iteration.
             self._apply_pending_steer_to_tool_results(messages, 1)
+            # Track per-tool retry count for budget enforcement
+            self._tool_retry_counts[function_name] = self._tool_retry_counts.get(function_name, 0) + 1
 
             if not self.quiet_mode:
                 if self.verbose_logging:
@@ -9261,6 +9420,7 @@ class AIAgent:
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
+        self._tool_retry_counts = {}
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -9547,7 +9707,7 @@ class AIAgent:
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
-            self._checkpoint_mgr.new_turn()
+            self._checkpoint_service.new_turn()
 
             # Check for interrupt request (e.g., user sent new message)
             if self._interrupt_requested:
@@ -9774,9 +9934,10 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            _err_rec = self._config.get('error_recovery', {})
+            max_retries = _err_rec.get('max_retries', 5)
             primary_recovery_attempted = False
-            max_compression_attempts = 3
+            max_compression_attempts = getattr(self.context_compressor, 'max_window_retries', 3) if self.context_compressor else 3
             codex_auth_retry_attempted=False
             anthropic_auth_retry_attempted=False
             nous_auth_retry_attempted=False
@@ -9903,11 +10064,23 @@ class AIAgent:
                             _use_streaming = False
 
                     if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
-                        )
+                        _queue_wait = self._acquire_api_queue_slot()
+                        if _queue_wait:
+                            time.sleep(_queue_wait)
+                        try:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        finally:
+                            self._release_api_queue_slot()
                     else:
-                        response = self._interruptible_api_call(api_kwargs)
+                        _queue_wait = self._acquire_api_queue_slot()
+                        if _queue_wait:
+                            time.sleep(_queue_wait)
+                        try:
+                            response = self._interruptible_api_call(api_kwargs)
+                        finally:
+                            self._release_api_queue_slot()
                     
                     api_duration = time.time() - api_start_time
                     
@@ -10089,8 +10262,12 @@ class AIAgent:
                                 "failed": True  # Mark as failure for filtering
                             }
                         
-                        # Backoff before retry — jittered exponential: 5s base, 120s cap
-                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                        # Backoff before retry — jittered exponential (config-driven)
+                        wait_time = jittered_backoff(
+                            retry_count,
+                            base_delay=_err_rec.get('base_delay', 5.0),
+                            max_delay=_err_rec.get('max_delay', 120.0),
+                        )
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
@@ -10937,6 +11114,13 @@ class AIAgent:
                     if is_payload_too_large:
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
+                            # Last-ditch sliding window fallback before giving up
+                            _sw = self._sliding_window_fallback(messages, system_message)
+                            if _sw:
+                                messages, active_system_prompt = _sw
+                                conversation_history = None
+                                restart_with_compressed_messages = True
+                                break
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
@@ -11021,6 +11205,13 @@ class AIAgent:
                             # loop forever if the error keeps recurring.
                             compression_attempts += 1
                             if compression_attempts > max_compression_attempts:
+                                # Last-ditch sliding window fallback before giving up
+                                _sw = self._sliding_window_fallback(messages, system_message)
+                                if _sw:
+                                    messages, active_system_prompt = _sw
+                                    conversation_history = None
+                                    restart_with_compressed_messages = True
+                                    break
                                 self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                                 self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
@@ -11073,6 +11264,13 @@ class AIAgent:
 
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
+                            # Last-ditch sliding window fallback before giving up
+                            _sw = self._sliding_window_fallback(messages, system_message)
+                            if _sw:
+                                messages, active_system_prompt = _sw
+                                conversation_history = None
+                                restart_with_compressed_messages = True
+                                break
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
@@ -11297,7 +11495,11 @@ class AIAgent:
                                     _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count,
+                        base_delay=_err_rec.get('rate_limit_base_delay', 2.0),
+                        max_delay=_err_rec.get('rate_limit_max_delay', 60.0),
+                    )
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                     else:

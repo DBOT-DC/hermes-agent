@@ -623,7 +623,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default") -> str:
+               task_id: str = "default", **kw) -> str:
     """Patch a file using replace mode or V4A patch format."""
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
@@ -657,6 +657,93 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             if not patch:
                 return tool_error("patch content required")
             result = file_ops.patch_v4a(patch)
+        elif mode == "batch":
+            # Batch mode: validate all changes first, then apply.
+            # Accepts a `changes` kwarg (list of dicts with path, old_string,
+            # new_string, and optional replace_all).
+            changes = kw.get("changes", [])
+            if not changes:
+                return tool_error("batch mode requires a non-empty 'changes' list")
+
+            # Pre-flight validation: check all changes before applying any.
+            validation_errors = []
+            for i, change in enumerate(changes):
+                c_path = change.get("path")
+                c_old = change.get("old_string")
+                # path and old_string are required
+                if not c_path or c_old is None:
+                    validation_errors.append({
+                        "index": i,
+                        "path": c_path or "<missing>",
+                        "error": "path and old_string are required",
+                    })
+                    continue
+                # Sensitive path check
+                sensitive_err = _check_sensitive_path(c_path)
+                if sensitive_err:
+                    validation_errors.append({
+                        "index": i,
+                        "path": c_path,
+                        "error": sensitive_err,
+                    })
+                    continue
+                # File existence and old_string presence
+                file_result = file_ops.read_file_raw(c_path)
+                if file_result.error:
+                    validation_errors.append({
+                        "index": i,
+                        "path": c_path,
+                        "error": f"File not found: {c_path}",
+                    })
+                    continue
+                if c_old not in file_result.content:
+                    validation_errors.append({
+                        "index": i,
+                        "path": c_path,
+                        "error": "old_string not found",
+                    })
+
+            if validation_errors:
+                return json.dumps({
+                    "success": False,
+                    "applied": [],
+                    "failed": validation_errors,
+                    "diff": "",
+                    "mode": "batch",
+                }, ensure_ascii=False)
+
+            # All validated — apply changes sequentially.
+            applied = []
+            failed = []
+            combined_diff_parts = []
+
+            for i, change in enumerate(changes):
+                c_path = change["path"]
+                c_old = change["old_string"]
+                c_new = change.get("new_string", "")  # defaults to empty (deletion)
+                c_replace_all = change.get("replace_all", False)
+
+                result = file_ops.patch_replace(c_path, c_old, c_new, c_replace_all)
+                if result.success:
+                    applied.append({"index": i, "path": c_path, "diff": result.diff})
+                    if result.diff:
+                        combined_diff_parts.append(result.diff)
+                else:
+                    failed.append({
+                        "index": i,
+                        "path": c_path,
+                        "error": result.error or "patch failed",
+                    })
+                    # Note: previous changes in the batch are already applied
+                    # (partial failure scenario in test_partial_failure_reports_both_applied_and_failed)
+
+            return json.dumps({
+                "success": len(failed) == 0,
+                "applied": applied,
+                "failed": failed,
+                "diff": "".join(combined_diff_parts),
+                "mode": "batch",
+            }, ensure_ascii=False)
         else:
             return tool_error(f"Unknown mode: {mode}")
         

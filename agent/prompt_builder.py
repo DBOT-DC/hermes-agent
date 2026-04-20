@@ -410,6 +410,82 @@ WSL_ENVIRONMENT_HINT = (
 )
 
 
+def build_mode_prompt(cwd: Optional[Path] = None) -> str:
+    """
+    Return the mode-specific system prompt section.
+
+    When a mode is active, injects the mode's role definition and custom
+    instructions. When no mode is active (default), returns an empty string.
+
+    3-tier instruction hierarchy (each tier appends, doesn't replace):
+      1. Global config — mode's role_definition + built-in guidance
+      2. Mode custom_instructions — from the active mode definition
+      3. Project instructions — from <cwd>/.hermes/instructions.md (appended last)
+
+    Args:
+        cwd: The working directory for the current task. When provided,
+             project-level instructions are loaded from <cwd>/.hermes/instructions.md
+             and appended with highest priority.
+    """
+    try:
+        from agent.modes import get_active_mode
+    except Exception:
+        return ""  # modes module unavailable
+
+    mode = get_active_mode()
+    if mode is None:
+        return ""
+
+    parts = [f"# Mode: {mode.name}\n"]
+    parts.append(mode.role_definition)
+
+    if mode.custom_instructions:
+        parts.append(mode.custom_instructions)
+
+    # Tier 3: Project-level instructions (highest priority, appended last)
+    if cwd is not None:
+        project_instructions = _load_project_instructions(cwd)
+        if project_instructions:
+            parts.append(project_instructions)
+
+    # If orchestrator (no direct tools), reinforce the delegation pattern
+    if mode.slug == "orchestrator":
+        parts.append(
+            "Reminder: you have NO direct tool access. "
+            "Use delegate_task to create specialist subagents for all work. "
+            "You coordinate and synthesise — you do not execute directly."
+        )
+
+    return "\n\n".join(parts)
+
+
+def _load_project_instructions(cwd) -> str:
+    """
+    Load project-level instructions from <cwd>/.hermes/instructions.md.
+
+    Returns an empty string if the file does not exist.
+    Content is scanned for prompt injection threats before loading.
+    Accepts str or Path for cwd.
+    """
+    from pathlib import Path
+    cwd = Path(cwd) if cwd else None
+    if cwd is None:
+        return ""
+    instructions_file = cwd / ".hermes" / "instructions.md"
+    if not instructions_file.is_file():
+        return ""
+    try:
+        content = instructions_file.read_text(encoding="utf-8").strip()
+        if not content:
+            return ""
+        content = _scan_context_content(content, str(instructions_file))
+        result = f"## Project Instructions ({instructions_file})\n\n{content}"
+        return _truncate_content(result, ".hermes/instructions.md")
+    except Exception as e:
+        logger.debug("Could not read %s: %s", instructions_file, e)
+        return ""
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 

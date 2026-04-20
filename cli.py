@@ -4022,6 +4022,14 @@ class HermesCLI:
         if len(model_short) > 30:
             model_short = model_short[:27] + "..."
 
+        # Get active mode
+        try:
+            from agent.modes import get_active_mode
+            active_mode = get_active_mode()
+            mode_display = f"[bold yellow]{active_mode.slug}[/]" if active_mode else "[dim]no mode[/]"
+        except Exception:
+            mode_display = "[dim]?[/]"
+
         # Get API status indicator
         if self.api_key:
             api_indicator = "[green bold]●[/]"
@@ -4047,6 +4055,7 @@ class HermesCLI:
 
         self._console_print(
             f"  {api_indicator} [{accent_color}]{model_short}[/] "
+            f"[dim {separator_color}]·[/] {mode_display} "
             f"[dim {separator_color}]·[/] [bold {label_color}]{tool_count} tools[/]"
             f"{toolsets_info}{provider_info}"
         )
@@ -5369,6 +5378,82 @@ class HermesCLI:
             self._console_print(f"    {header:40s}  {bar}  {pct_str}")
         self._console_print()
 
+    def _handle_mode_switch(self, cmd_original: str):
+        """Handle /mode command — switch or list operational modes."""
+        from agent.modes import list_modes, set_active_mode, get_active_mode
+        try:
+            parts = cmd_original.strip().split(None, 1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else None
+        except (IndexError, AttributeError):
+            arg = None
+
+        if arg == "list" or arg is None:
+            modes = list_modes()
+            current = get_active_mode()
+            _cprint(f"\n  Current mode: [bold cyan]{current.slug if current else 'none'}[/]")
+            _cprint(f"  {'─' * 40}")
+            for m in modes:
+                marker = " ◀" if current and m.slug == current.slug else ""
+                groups = ", ".join(m.tool_groups) if m.tool_groups else "(delegates only)"
+                _cprint(f"  [bold]{m.slug}[/] — {m.name}: {m.when_to_use}")
+                _cprint(f"    Groups: {groups}{marker}")
+        else:
+            mode = set_active_mode(arg)
+            if mode:
+                _cprint(f"  ✅ Switched to [bold cyan]{mode.slug}[/] mode — {mode.name}")
+                _cprint(f"     {mode.role_definition[:120]}...")
+                # Show tool count for the new mode
+                from model_tools import get_tool_definitions
+                mode_tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                tool_count = len(mode_tools) if mode_tools else 0
+                groups = ", ".join(mode.tool_groups) if mode.tool_groups else "delegates only"
+                _cprint(f"     [bold]{tool_count}[/] tools available ({groups})")
+            else:
+                _cprint(f"  ❌ Unknown mode: '{arg}'. Use /mode list to see available modes.")
+
+    def _handle_checkpoint_command(self, cmd_original: str):
+        """Handle /checkpoint command — manage git checkpoints."""
+        try:
+            parts = cmd_original.strip().split(None, 1)
+            action = parts[1].strip().lower() if len(parts) > 1 else "list"
+        except (IndexError, AttributeError):
+            action = "list"
+
+        agent = getattr(self, '_agent', None)
+        svc = getattr(agent, '_checkpoint_service', None) if agent else None
+
+        if not svc or not getattr(svc, 'enabled', False):
+            _cprint("  ⚠️  Checkpoints not enabled. Set checkpoints.enabled: true in config.yaml")
+            return
+
+        if action == "list":
+            cps = svc.list_checkpoints(self.session_id)
+            if not cps:
+                _cprint("  No checkpoints for this session.")
+            else:
+                _cprint(f"  Checkpoints ({len(cps)}):")
+                for cp in cps[:20]:
+                    _cprint(f"    {cp.get('id', '?')[:12]} — {cp.get('message', '')} — {cp.get('timestamp', '')}")
+        elif action == "save":
+            msg = parts[2].strip() if len(parts) > 2 else "manual checkpoint"
+            cp = svc.save_checkpoint(msg, self.session_id)
+            _cprint(f"  ✅ Checkpoint saved: {cp[:12]}")
+        elif action == "restore":
+            if len(parts) < 3:
+                _cprint("  Usage: /checkpoint restore <checkpoint_id>")
+                return
+            result = svc.restore_checkpoint(parts[2].strip())
+            _cprint(f"  {'✅ Restored' if result else '❌ Failed'}: {parts[2].strip()[:12]}")
+        elif action == "diff":
+            cp_id = parts[2].strip() if len(parts) > 2 else None
+            diff = svc.diff_checkpoint(cp_id, self.session_id)
+            _cprint(diff if diff else "  No diff available.")
+        elif action == "clear":
+            svc.clear_checkpoints(self.session_id)
+            _cprint("  ✅ All checkpoints cleared.")
+        else:
+            _cprint(f"  Unknown action: '{action}'. Use: list, save, restore, diff, clear")
+
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
         parts = cmd.split(maxsplit=1)
@@ -5876,6 +5961,10 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "mode":
+            self._handle_mode_switch(cmd_original)
+        elif canonical == "checkpoint":
+            self._handle_checkpoint_command(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "gquota":
