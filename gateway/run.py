@@ -5360,9 +5360,10 @@ class GatewayRunner:
             lines.append(f"\nUse `/mode <name>` to switch.")
             return "\n".join(lines)
 
-        # Switch mode
+        # Switch mode — extract only the first word as the mode slug
+        mode_slug = args.split()[0] if args.split() else args
         try:
-            mode = set_active_mode(args)
+            mode = set_active_mode(mode_slug)
             if mode is None:
                 return "🔄 Mode cleared (default tools)."
             groups = ", ".join(mode.tool_groups) if mode.tool_groups else "delegation only"
