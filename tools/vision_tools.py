@@ -406,6 +406,7 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    provider: str = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -575,6 +576,8 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        if provider:
+            call_kwargs["provider"] = provider
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
             response = await async_call_llm(**call_kwargs)
@@ -772,6 +775,22 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+def _parse_provider_model(model_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse 'provider:model' format into (provider, model) tuple.
+
+    Handles env var values like 'zai:glm-4.6' or 'openrouter:google/gemini-3-flash'.
+    Returns (provider, model) where either may be None if not specified.
+    """
+    if not model_str:
+        return None, None
+    # Only split on the first colon if it looks like a provider:model format
+    # (provider names don't contain slashes, model names often do)
+    if ":" in model_str and "/" not in model_str.split(":", 1)[0]:
+        provider, model = model_str.split(":", 1)
+        return provider.strip() or None, model.strip() or None
+    return None, model_str.strip() or None
+
+
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
@@ -779,8 +798,10 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
+    env_model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    # Parse provider:model format from env var (e.g., 'zai:glm-4.6')
+    provider_override, model = _parse_provider_model(env_model)
+    return vision_analyze_tool(image_url, full_prompt, model, provider=provider_override)
 
 
 registry.register(

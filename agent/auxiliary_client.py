@@ -1701,18 +1701,35 @@ def resolve_provider_client(
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
+        base_url = str(creds.get("base_url", "")).strip().rstrip("/") or ""
+
+        # Fallback: check the credential pool when env/config has no key.
+        # The main agent loop uses the pool, but the auxiliary/vision path
+        # previously only checked env vars and config.yaml api_key field.
+        if not api_key:
+            pool_present, pool_entry = _select_pool_entry(provider)
+            if pool_present and pool_entry is not None:
+                api_key = _pool_runtime_api_key(pool_entry)
+                pool_base_url = _pool_runtime_base_url(pool_entry, pconfig.inference_base_url)
+                if pool_base_url:
+                    base_url = pool_base_url
+                logger.debug(
+                    "resolve_provider_client: provider %s API key resolved "
+                    "from credential pool (source: %s)",
+                    provider, getattr(pool_entry, "source", "pool"),
+                )
+
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
                 tried_sources.append("gh auth token")
+            tried_sources.append("credential_pool")
             logger.debug("resolve_provider_client: provider %s has no API "
                          "key configured (tried: %s)",
                          provider, ", ".join(tried_sources))
             return None, None
 
-        base_url = _to_openai_base_url(
-            str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        )
+        base_url = _to_openai_base_url(base_url or pconfig.inference_base_url)
 
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = _normalize_resolved_model(model or default_model, provider)
