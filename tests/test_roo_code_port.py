@@ -69,10 +69,14 @@ class TestModes:
         assert isinstance(modes, dict)
         assert len(modes) >= 5
 
-    def test_orchestrator_no_direct_tools(self):
+    def test_orchestrator_has_full_tool_access(self):
         from agent.modes import get_mode
         orch = get_mode("orchestrator")
-        assert orch.tool_groups == []
+        # Orchestrator has full access — it switches modes to gate tools per phase
+        assert "read" in orch.tool_groups
+        assert "edit" in orch.tool_groups
+        assert "command" in orch.tool_groups
+        assert "mcp" in orch.tool_groups
 
     def test_ask_no_edit_command(self):
         from agent.modes import get_mode
@@ -106,9 +110,10 @@ class TestModes:
     def test_is_tool_allowed_orchestrator_mode(self):
         from agent.modes import get_mode
         orch = get_mode("orchestrator")
-        assert not orch.is_tool_allowed("read_file")
-        assert not orch.is_tool_allowed("write_file")
-        assert not orch.is_tool_allowed("terminal")
+        # Orchestrator has full access — switches modes to gate per phase
+        assert orch.is_tool_allowed("read_file")
+        assert orch.is_tool_allowed("write_file")
+        assert orch.is_tool_allowed("terminal")
         assert orch.is_tool_allowed("switch_mode")
         assert orch.is_tool_allowed("delegate_task")
 
@@ -181,15 +186,16 @@ class TestToolGating:
         assert "read_file" in names
         assert "switch_mode" in names
 
-    def test_orchestrator_mode_minimal_tools(self):
+    def test_orchestrator_mode_full_tools(self):
         from model_tools import get_tool_definitions
         from agent.modes import get_mode
         orch = get_mode("orchestrator")
         tools = get_tool_definitions(quiet_mode=True, active_mode=orch)
         names = {t["function"]["name"] for t in tools}
-        assert "terminal" not in names
-        assert "write_file" not in names
-        assert "read_file" not in names
+        # Orchestrator has full tool access (switches modes to gate per phase)
+        assert "terminal" in names
+        assert "write_file" in names
+        assert "read_file" in names
         assert "switch_mode" in names
         assert "delegate_task" in names
         assert "todo" in names

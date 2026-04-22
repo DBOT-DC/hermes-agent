@@ -63,10 +63,11 @@ class TestE2EModeSystem:
         assert arch.has_file_constraint()
         assert ".py" not in arch.constraints["file_regex"]  # only md/yaml/json/etc
 
-        # Orchestrator — no direct tools except always-available
+        # Orchestrator — has full access, switches modes to gate per phase
         orch = set_active_mode("orchestrator")
-        assert not orch.is_tool_allowed("read_file")  # no groups at all
-        assert not orch.is_tool_allowed("terminal")
+        assert orch.is_tool_allowed("read_file")  # full access
+        assert orch.is_tool_allowed("terminal")   # full access
+        assert orch.is_tool_allowed("write_file") # full access
         assert orch.is_tool_allowed("switch_mode")  # always available
         assert orch.is_tool_allowed("delegate_task")  # always available
         assert orch.is_tool_allowed("todo")  # always available
@@ -556,12 +557,13 @@ class TestE2EModelToolsIntegration:
 
         assert "switch_mode" in orch_names
         assert "delegate_task" in orch_names
-        assert "terminal" not in orch_names  # no groups
-        assert "read_file" not in orch_names  # no groups
-        assert "write_file" not in orch_names  # no groups
+        # Orchestrator has full access (switches modes to gate per phase)
+        assert "terminal" in orch_names
+        assert "read_file" in orch_names
+        assert "write_file" in orch_names
 
-        # Orchestrator should be strictly fewer than ask mode
-        assert len(orch_names) < len(ask_names), \
+        # Orchestrator should have the same tools as code mode (full access)
+        assert len(orch_names) == len(code_names), \
             f"Orchestrator ({len(orch_names)}) should have fewer tools than ask ({len(ask_names)})"
 
         # Cleanup

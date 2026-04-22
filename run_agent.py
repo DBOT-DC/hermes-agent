@@ -7640,6 +7640,31 @@ class AIAgent:
             result = switch_mode_handler(function_args)
             # Refresh tool list after mode switch
             self._refresh_tools_for_mode()
+            # Inject mode role definition into conversation so the LLM
+            # actually adopts the new persona (Roo Code style).
+            try:
+                from agent.modes import get_active_mode
+                active = get_active_mode()
+                if active and active.role_definition:
+                    mode_injection = (
+                        f"<mode-switch>\n"
+                        f"You are now in **{active.name}** mode.\n\n"
+                        f"{active.role_definition}\n\n"
+                        f"Tool groups: {', '.join(active.tool_groups) if active.tool_groups else 'delegation only'}\n"
+                        f"When to use: {active.when_to_use}\n"
+                        f"</mode-switch>"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": mode_injection,
+                    })
+                    # Echo it back as assistant acknowledgment so the LLM sees context
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"Switched to {active.name} mode. Adopting specialist role — {active.when_to_use}.",
+                    })
+            except Exception as e:
+                logger.warning("Failed to inject mode context: %s", e)
             return result
         else:
             return handle_function_call(
@@ -8213,6 +8238,29 @@ class AIAgent:
                 self._refresh_tools_for_mode()
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  🔄 Mode switched in {tool_duration:.1f}s")
+                # Inject mode role definition into conversation (Roo Code style)
+                try:
+                    from agent.modes import get_active_mode
+                    active = get_active_mode()
+                    if active and active.role_definition:
+                        mode_injection = (
+                            f"<mode-switch>\n"
+                            f"You are now in **{active.name}** mode.\n\n"
+                            f"{active.role_definition}\n\n"
+                            f"Tool groups: {', '.join(active.tool_groups) if active.tool_groups else 'delegation only'}\n"
+                            f"When to use: {active.when_to_use}\n"
+                            f"</mode-switch>"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": mode_injection,
+                        })
+                        messages.append({
+                            "role": "assistant",
+                            "content": f"Switched to {active.name} mode. Adopting specialist role — {active.when_to_use}.",
+                        })
+                except Exception as e:
+                    logger.warning("Failed to inject mode context: %s", e)
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
