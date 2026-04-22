@@ -60,7 +60,41 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Mode system tools
+    "switch_mode", "orchestrate",
 ]
+
+
+# =============================================================================
+# Mode-based tool groups (Roo Code port)
+# =============================================================================
+
+# Tools that are ALWAYS available regardless of mode
+ALWAYS_AVAILABLE_TOOLS: Set[str] = {
+    "switch_mode", "delegate_task", "todo", "memory", "clarify",
+    "session_search", "cronjob", "send_message",
+    "skills_list", "skill_view", "skill_manage",
+    "orchestrate",
+}
+
+# Tool group → tool name mapping for mode-based gating
+TOOL_GROUPS: Dict[str, Set[str]] = {
+    "read": {
+        "read_file", "search_files",
+        "browser_navigate", "browser_snapshot", "browser_click",
+        "browser_type", "browser_scroll", "browser_back",
+        "browser_press", "browser_get_images", "browser_vision", "browser_console",
+        "web_search", "web_extract",
+        "vision_analyze",
+    },
+    "edit": {
+        "write_file", "patch", "execute_code",
+    },
+    "command": {
+        "terminal", "process",
+    },
+    "mcp": set(),  # Populated dynamically — any tool starting with "mcp_"
+}
 
 
 # Core toolset definitions

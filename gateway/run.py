@@ -3522,6 +3522,9 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "mode":
+            return await self._handle_mode_command(event)
+
         if canonical == "provider":
             return await self._handle_provider_command(event)
         
@@ -5338,6 +5341,36 @@ class GatewayRunner:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
     
+    async def _handle_mode_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /mode command — switch or list agent modes."""
+        args = event.get_command_args().strip()
+        try:
+            from agent.modes import list_modes, set_active_mode, get_active_mode
+        except Exception as e:
+            return f"⚠️ Mode system not available: {e}"
+
+        if not args or args == "list":
+            modes = list_modes()
+            active = get_active_mode()
+            lines = ["**🔄 Agent Modes:**\n"]
+            for slug, mode in modes.items():
+                marker = " ◀️" if active and active.slug == slug else ""
+                groups = ", ".join(mode.tool_groups) if mode.tool_groups else "delegation only"
+                lines.append(f"• **{mode.name}** (`{slug}`) — {groups}{marker}")
+            lines.append(f"\nUse `/mode <name>` to switch.")
+            return "\n".join(lines)
+
+        # Switch mode
+        try:
+            mode = set_active_mode(args)
+            if mode is None:
+                return "🔄 Mode cleared (default tools)."
+            groups = ", ".join(mode.tool_groups) if mode.tool_groups else "delegation only"
+            tool_count = len(mode.get_allowed_tools())
+            return f"🔄 Switched to **{mode.name}** mode\nTool groups: {groups}\nTools available: {tool_count}"
+        except ValueError as e:
+            return f"⚠️ {e}"
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

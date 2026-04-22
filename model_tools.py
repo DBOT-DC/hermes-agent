@@ -138,6 +138,12 @@ try:
 except Exception as e:
     logger.debug("MCP tool discovery failed: %s", e)
 
+# Mode system tool discovery
+try:
+    from tools import mode_tool  # noqa: F401 — triggers registry.register
+except Exception as e:
+    logger.debug("Mode tool discovery failed: %s", e)
+
 # Plugin tool discovery (user/project/pip plugins)
 try:
     from hermes_cli.plugins import discover_plugins
@@ -197,6 +203,7 @@ def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    active_mode=None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -207,6 +214,9 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        active_mode: A Mode object from agent.modes. If provided, filters tools
+                     based on mode's tool_groups. Always-available tools bypass
+                     mode gating.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -327,6 +337,22 @@ def get_tool_definitions(
                     }
                     break
 
+    # =========================================================================
+    # Mode-based tool gating (Roo Code port)
+    # =========================================================================
+    if active_mode is not None:
+        from toolsets import ALWAYS_AVAILABLE_TOOLS
+        mode_filtered = []
+        for td in filtered_tools:
+            tool_name = td["function"]["name"]
+            if tool_name in ALWAYS_AVAILABLE_TOOLS:
+                mode_filtered.append(td)
+            elif active_mode.is_tool_allowed(tool_name):
+                mode_filtered.append(td)
+            # else: tool is blocked by this mode — silently drop
+        filtered_tools = mode_filtered
+        available_tool_names = {t["function"]["name"] for t in filtered_tools}
+
     if not quiet_mode:
         if filtered_tools:
             tool_names = [t["function"]["name"] for t in filtered_tools]
@@ -348,7 +374,7 @@ def get_tool_definitions(
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task", "switch_mode"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 

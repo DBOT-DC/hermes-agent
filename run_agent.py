@@ -7635,6 +7635,12 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+        elif function_name == "switch_mode":
+            from tools.mode_tool import switch_mode_handler
+            result = switch_mode_handler(function_args)
+            # Refresh tool list after mode switch
+            self._refresh_tools_for_mode()
+            return result
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7668,6 +7674,25 @@ class AIAgent:
                 out_lines.extend(wrapped or [raw_line])
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
+
+    def _refresh_tools_for_mode(self):
+        """Refresh the tool list based on the current active mode.
+
+        Called after switch_mode to ensure the LLM sees the correct
+        tool set for the new mode.
+        """
+        try:
+            from agent.modes import get_active_mode
+            active = get_active_mode()
+            self.tools = get_tool_definitions(
+                enabled_toolsets=self._enabled_toolsets,
+                disabled_toolsets=self._disabled_toolsets,
+                quiet_mode=self.quiet_mode,
+                active_mode=active,
+            )
+            self.valid_tool_names = {t["function"]["name"] for t in (self.tools or [])}
+        except Exception as e:
+            logger.warning("Failed to refresh tools for mode: %s", e)
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
@@ -8180,6 +8205,14 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == "switch_mode":
+                from tools.mode_tool import switch_mode_handler
+                function_result = switch_mode_handler(function_args)
+                tool_duration = time.time() - tool_start_time
+                # Refresh tool list after mode switch
+                self._refresh_tools_for_mode()
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  🔄 Mode switched in {tool_duration:.1f}s")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None

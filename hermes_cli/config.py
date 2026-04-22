@@ -376,8 +376,25 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        # Mode system: default mode on startup. Use slug (code, architect, ask, debug, orchestrator).
+        # WARNING: Do NOT set to "orchestrator" in production — it blocks direct tool access.
+        "default_mode": "",
     },
-    
+
+    "modes": {
+        # Custom mode definitions are loaded from ~/.hermes/modes/*.yaml
+        # This section is for mode system configuration only.
+        "auto_load": True,  # Load custom modes from ~/.hermes/modes/ on startup
+    },
+
+    "context": {
+        # Context management settings (Roo Code port)
+        "auto_condense_percent": 80,  # Start condensation at this % of context window
+        "forced_reduction_percent": 75,  # Reduce to this % on overflow
+        "max_window_retries": 3,  # Max sliding window fallback attempts
+        "token_buffer_percent": 10,  # Reserve 10% as safety buffer
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",

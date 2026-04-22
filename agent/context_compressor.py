@@ -376,6 +376,49 @@ class ContextCompressor(ContextEngine):
             return False
         return True
 
+    def sliding_window_truncate(
+        self,
+        messages: List[Dict[str, Any]],
+        target_percent: float = 75.0,
+    ) -> List[Dict[str, Any]]:
+        """Non-destructive sliding window truncation.
+
+        Removes oldest messages (non-system) until the message count
+        is at most target_percent of the original. Preserves the
+        system message and the last few messages for continuity.
+
+        This is a last-resort fallback when compression fails to
+        reduce context enough.
+        """
+        if not messages:
+            return messages
+
+        target_count = max(4, int(len(messages) * target_percent / 100))
+
+        # Separate system messages from conversation messages
+        system_msgs = []
+        conv_msgs = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_msgs.append(msg)
+            else:
+                conv_msgs.append(msg)
+
+        if len(conv_msgs) <= target_count:
+            return messages
+
+        # Keep the most recent messages
+        keep_count = target_count - len(system_msgs)
+        kept = conv_msgs[-keep_count:]
+        removed = len(conv_msgs) - keep_count
+
+        logger.info(
+            "Sliding window: removed %d oldest messages (kept %d of %d)",
+            removed, keep_count, len(conv_msgs),
+        )
+
+        return system_msgs + kept
+
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
